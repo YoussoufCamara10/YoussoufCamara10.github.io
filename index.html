@@ -786,6 +786,8 @@ header{
 }
 .btn-tuto-trigger:hover { border-color:var(--un-blue); color:var(--un-blue); }
 </style>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
 </head>
 <body>
 <div class="app">
@@ -1207,30 +1209,28 @@ const firebaseConfig = {
 };
 
 let _db = null;
-async function getDB() {
+function getDB() {
   if (_db) return _db;
   try {
-    const { initializeApp, getApps } = await import('https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js');
-    const { getFirestore, doc, setDoc, getDoc } = await import('https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js');
-    const app = getApps().length ? getApps()[0] : initializeApp(firebaseConfig);
-    _db = getFirestore(app);
-    window._fsDoc = doc; window._fsSet = setDoc; window._fsGet = getDoc;
+    if (typeof firebase === 'undefined') return null;
+    if (!firebase.apps.length) firebase.initializeApp(firebaseConfig);
+    _db = firebase.firestore();
     return _db;
   } catch(e) { console.warn('Firebase init failed:', e); return null; }
 }
 
 async function dbGet(key) {
   try {
-    const db = await getDB(); if (!db) return null;
-    const snap = await window._fsGet(window._fsDoc(db, 'fclevis', key));
-    return snap.exists() ? snap.data().value : null;
+    const db = getDB(); if (!db) return null;
+    const snap = await db.collection('fclevis').doc(key).get();
+    return snap.exists ? snap.data().value : null;
   } catch(e) { return null; }
 }
 
 async function dbSet(key, val) {
   try {
-    const db = await getDB(); if (!db) return;
-    await window._fsSet(window._fsDoc(db, 'fclevis', key), { value: val });
+    const db = getDB(); if (!db) return;
+    await db.collection('fclevis').doc(key).set({ value: val });
   } catch(e) { console.warn('DB set failed:', e); }
 }
 
@@ -1244,22 +1244,79 @@ async function syncFromDB() {
 }
 
 async function syncVoteToSheet(player, positions, number) {
-  const nums = loadNumbers();
-  if (number) { nums[player] = number; saveNumbers(nums); }
-  await Promise.all([
-    dbSet('votes',   JSON.stringify(loadVotes())),
-    dbSet('players', JSON.stringify(loadPlayers())),
-    dbSet('numbers', JSON.stringify(loadNumbers()))
-  ]);
+  try {
+    // 1. Charger les données existantes depuis Firebase
+    const [remoteVotesRaw, remotePlayersRaw, remoteNumbersRaw] = await Promise.all([
+      dbGet('votes'), dbGet('players'), dbGet('numbers')
+    ]);
+
+    // 2. Fusionner les votes
+    const remoteVotes = remoteVotesRaw ? JSON.parse(remoteVotesRaw) : {};
+    const localVotes  = loadVotes();
+    const today       = getToday();
+    if (!remoteVotes[today]) remoteVotes[today] = {};
+    // Copier tous les votes distants dans le local
+    Object.assign(remoteVotes[today], localVotes[today] || {});
+    // Ajouter le vote du joueur actuel
+    remoteVotes[today][player] = positions;
+    saveVotes(remoteVotes);
+
+    // 3. Fusionner les joueurs
+    const remotePlayers = remotePlayersRaw ? JSON.parse(remotePlayersRaw) : [];
+    const localPlayers  = loadPlayers();
+    const mergedPlayers = [...new Set([...remotePlayers, ...localPlayers])];
+    savePlayers(mergedPlayers);
+
+    // 4. Fusionner les numéros
+    const remoteNumbers = remoteNumbersRaw ? JSON.parse(remoteNumbersRaw) : {};
+    const localNumbers  = loadNumbers();
+    if (number) localNumbers[player] = number;
+    const mergedNumbers = { ...remoteNumbers, ...localNumbers };
+    saveNumbers(mergedNumbers);
+
+    // 5. Sauvegarder tout dans Firebase
+    await Promise.all([
+      dbSet('votes',   JSON.stringify(remoteVotes)),
+      dbSet('players', JSON.stringify(mergedPlayers)),
+      dbSet('numbers', JSON.stringify(mergedNumbers))
+    ]);
+  } catch(e) { console.warn('syncVoteToSheet failed:', e); }
 }
-async function syncDeleteToSheet() { await dbSet('votes', JSON.stringify(loadVotes())); }
+
+async function syncDeleteToSheet() {
+  try {
+    // Charger votes distants, appliquer suppression locale, remettre
+    const remoteRaw = await dbGet('votes');
+    const remote = remoteRaw ? JSON.parse(remoteRaw) : {};
+    const local  = loadVotes();
+    const today  = getToday();
+    if (!remote[today]) remote[today] = {};
+    remote[today] = { ...remote[today], ...(local[today] || {}) };
+    await dbSet('votes', JSON.stringify(remote));
+  } catch(e) { console.warn('syncDeleteToSheet failed:', e); }
+}
+
 async function syncPlayerToSheet(player, number) {
-  const nums = loadNumbers();
-  if (number) { nums[player] = number; saveNumbers(nums); }
-  await Promise.all([
-    dbSet('players', JSON.stringify(loadPlayers())),
-    dbSet('numbers', JSON.stringify(loadNumbers()))
-  ]);
+  try {
+    const [remotePlayersRaw, remoteNumbersRaw] = await Promise.all([
+      dbGet('players'), dbGet('numbers')
+    ]);
+    const remotePlayers = remotePlayersRaw ? JSON.parse(remotePlayersRaw) : [];
+    const localPlayers  = loadPlayers();
+    const mergedPlayers = [...new Set([...remotePlayers, ...localPlayers])];
+    savePlayers(mergedPlayers);
+
+    const remoteNumbers = remoteNumbersRaw ? JSON.parse(remoteNumbersRaw) : {};
+    const localNumbers  = loadNumbers();
+    if (number) localNumbers[player] = number;
+    const mergedNumbers = { ...remoteNumbers, ...localNumbers };
+    saveNumbers(mergedNumbers);
+
+    await Promise.all([
+      dbSet('players', JSON.stringify(mergedPlayers)),
+      dbSet('numbers', JSON.stringify(mergedNumbers))
+    ]);
+  } catch(e) { console.warn('syncPlayerToSheet failed:', e); }
 }
 async function fetchVotesFromSheet() { return null; }
 async function fetchAllVotesFromSheet() { return null; }
